@@ -1,0 +1,7 @@
+The core folder holds shared application infrastructure: settings and other concerns used across multiple parts of the backend. It should not hold Gurukul-specific business rules or individual HTTP endpoints.
+
+Currently, core/config.py defines the application settings, 
+such as the database URL, Redis URL, and allowed frontend origins. 
+get_settings() provides those settings, 
+and @lru_cache means the settings object is reused rather than rebuilt for every call.
+

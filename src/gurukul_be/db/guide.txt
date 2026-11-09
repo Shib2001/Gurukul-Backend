@@ -1,0 +1,6 @@
+This folder contains the shared SQLAlchemy setup for connecting to and working with the database. The actual table definitions should live in models/, not here.
+
+base.py defines the common SQLAlchemy Base class. Each database model will inherit from it, so SQLAlchemy can collect the models’ table metadata.
+session.py creates the async database engine and session factory using DATABASE_URL from core/config.py. Its get_db() function provides a session for a request and closes it afterward.
+For example, an API endpoint can get a session, call a service, and the service can use that session to query or update models. 
+Database migration files are usually kept in an alembic/ directory at the project root, rather than in db/.

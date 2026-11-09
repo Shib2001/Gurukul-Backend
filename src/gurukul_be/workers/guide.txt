@@ -1,0 +1,21 @@
+Suppose the app also asks an AI service to write personalized feedback. That might take several seconds, or the AI service might temporarily fail. The API does not have to keep the student waiting for it:
+
+The service saves the quiz submission.
+It queues a feedback job and returns the quiz result promptly.
+A worker picks up the queued job.
+The worker asks the AI service for feedback, saves the result, and can retry if something temporarily fails.
+That background task might live in workers/quiz_feedback.py.
+
+
+
+Student
+  -> API route
+  -> quiz service
+       -> save submission to database
+       -> queue feedback job
+  <- response with quiz score
+
+Worker
+  -> read feedback job
+  -> call AI service
+  -> save feedback

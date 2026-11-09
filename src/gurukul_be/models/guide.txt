@@ -1,0 +1,6 @@
+models: how data is stored
+A model usually represents a database table, defined with SQLAlchemy. 
+For example, a User model might map to a users table with columns such as id, email, password_hash, and created_at. 
+Models inherit from the shared SQLAlchemy Base in db/base.py.
+
+Models describe persistence: what data the application stores and how it relates to other stored data.

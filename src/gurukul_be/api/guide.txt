@@ -1,0 +1,18 @@
+# What does this file represnt ?
+
+The api folder is where HTTP endpoints and route grouping belong. For example, as the backend grows, it might contain:
+
+api/
+  __init__.py
+  router.py
+  health.py
+  users.py
+
+then in health.py ( we are gonna write the health endpoints)
+in users.py we are gonna write the endpoints for users 
+
+
+__init__.py tells Python this directory is an importable package, 
+so code can import from paths such as gurukul_be.api. 
+It can be empty. Modern Python can also import many directories without it, 
+but keeping it makes the package structure explicit and works consistently with common tooling

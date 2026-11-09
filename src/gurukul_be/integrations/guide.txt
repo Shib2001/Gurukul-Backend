@@ -1,0 +1,7 @@
+Currently, integrations only has __init__.py; it’s an empty package marker. This folder is intended for code that communicates with external systems, keeping those details out of API routes and business logic.
+
+Based on the settings already in core/config.py, likely integration modules could include:
+
+ai_service.py for requests to the separately hosted AI service.
+object_storage.py for file uploads and downloads.
+Later, modules for email, authentication providers, or other third-party services if the project needs them.

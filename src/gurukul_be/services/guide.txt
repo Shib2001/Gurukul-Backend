@@ -1,0 +1,14 @@
+The student sends answers to an API endpoint:
+
+POST /quizzes/42/submit
+
+What happens in the request
+Schema checks the request’s shape: for example, that it contains answers in the expected format.
+API route receives the request and passes the data to a service.
+Service performs the application’s rules:
+Does this quiz exist?
+Is it still open?
+Is this student allowed to submit it?
+Save the answers and calculate the score.
+The API returns the result to the student.
+That work belongs in something like services/quiz_service.py. The route handles HTTP details; the service handles the “submit a quiz” operation.
