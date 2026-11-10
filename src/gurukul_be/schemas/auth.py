@@ -93,6 +93,15 @@ class PasswordResetConfirmRequest(BaseModel):
     new_password: str = Field(min_length=8, max_length=128)
 
 
+class EmailVerificationRequest(BaseModel):
+    identifier: str = Field(min_length=1, max_length=320)
+    code: str = Field(pattern=r"^\d{6}$")
+
+
+class EmailVerificationResendRequest(BaseModel):
+    identifier: str = Field(min_length=1, max_length=320)
+
+
 class StudentResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -159,6 +168,16 @@ class RefreshRequest(BaseModel):
 
 class MessageData(BaseModel):
     message: str
+
+
+class RegistrationPendingData(MessageData):
+    email: EmailStr
+    roll_number: str
+    verification_code: str | None = None
+
+
+class EmailVerificationResendData(MessageData):
+    verification_code: str | None = None
 
 
 class PasswordResetRequestData(MessageData):

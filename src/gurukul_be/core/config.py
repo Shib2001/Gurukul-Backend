@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     SMTP_STARTTLS: bool = True
     SMTP_TIMEOUT_SECONDS: int = Field(default=10, gt=0, le=60)
     PASSWORD_RESET_RETURN_CODE_IN_RESPONSE: bool = False
+    EMAIL_VERIFICATION_RETURN_CODE_IN_RESPONSE: bool = False
     OBJECT_STORAGE_BUCKET: str = "gurukul-local"
     OBJECT_STORAGE_ENDPOINT: str = "http://localhost:9000"
     OBJECT_STORAGE_ACCESS_KEY: str = "replace-me"

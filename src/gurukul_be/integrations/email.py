@@ -40,6 +40,30 @@ def send_password_reset_code(
         "If you did not request a password reset, you can ignore this email."
     )
 
+    _send_message(message, config)
+
+
+def send_email_verification_code(
+    recipient: str, code: str, settings: Settings | None = None
+) -> None:
+    config = settings or get_settings()
+    validate_email_configuration(config)
+
+    message = EmailMessage()
+    message["Subject"] = "Verify your Gurukul email address"
+    message["From"] = config.SMTP_FROM_EMAIL
+    message["To"] = recipient
+    message.set_content(
+        "Use this code to verify your Gurukul account:\n\n"
+        f"{code}\n\n"
+        "This code expires in 10 minutes. If you did not create this account, "
+        "you can ignore this email."
+    )
+
+    _send_message(message, config)
+
+
+def _send_message(message: EmailMessage, config: Settings) -> None:
     smtp_context = ssl.create_default_context()
     if config.SMTP_USE_SSL:
         with smtplib.SMTP_SSL(

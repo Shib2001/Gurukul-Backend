@@ -911,6 +911,7 @@ SMTP_USE_SSL=false
 SMTP_STARTTLS=true
 SMTP_TIMEOUT_SECONDS=10
 PASSWORD_RESET_RETURN_CODE_IN_RESPONSE=false
+EMAIL_VERIFICATION_RETURN_CODE_IN_RESPONSE=false
 OBJECT_STORAGE_BUCKET=gurukul-local
 OBJECT_STORAGE_ENDPOINT=http://localhost:9000
 OBJECT_STORAGE_ACCESS_KEY=replace-me
@@ -924,6 +925,11 @@ For local Swagger testing only, set `PASSWORD_RESET_RETURN_CODE_IN_RESPONSE=true
 while `APP_ENV=development`. The password-reset request then returns the OTP
 instead of sending an email. This option is ignored outside development; keep it
 disabled outside local testing.
+
+Likewise, `EMAIL_VERIFICATION_RETURN_CODE_IN_RESPONSE=true` returns new-account
+verification codes in the registration/resend response only when
+`APP_ENV=development`; it disables email delivery for those requests. Do not
+enable it outside local testing.
 
 ### 6.2 Required configuration behavior
 
@@ -1224,10 +1230,11 @@ generate or validate TypeScript types from the exact contract.
 
 ```text
 POST   /api/v1/auth/register
+POST   /api/v1/auth/verify-email
+POST   /api/v1/auth/verify-email/resend
 POST   /api/v1/auth/login
 POST   /api/v1/auth/logout
 POST   /api/v1/auth/refresh
-POST   /api/v1/auth/verify-email
 POST   /api/v1/auth/password-reset/request
 POST   /api/v1/auth/password-reset/verify
 POST   /api/v1/auth/password-reset/confirm
@@ -1246,12 +1253,19 @@ keyed hashes, and allow at most five verification attempts. Requests are
 throttled per account; reset tokens expire after 15 minutes and are single-use.
 Set SMTP configuration before enabling these endpoints.
 
-Registration and login return a 30-minute access token and a 30-day refresh
-token. Refresh tokens are opaque, stored only as keyed hashes, and rotated on
-every refresh. Reuse of a revoked refresh token revokes all sessions for that
-account. Password reset invalidates outstanding access and refresh tokens.
+After email verification, verification and login return a 30-minute access
+token and a 30-day refresh token. Refresh tokens are opaque, stored only as
+keyed hashes, and rotated on every refresh. Reuse of a revoked refresh token
+revokes all sessions for that account. Password reset invalidates outstanding
+access and refresh tokens.
 Logout revokes the submitted refresh token; an already-issued access token
 may remain valid until its short expiry.
+
+Registration creates a pending account and emails a six-digit verification
+code; it does not issue tokens until `POST /api/v1/auth/verify-email` accepts
+the code. Codes expire after 10 minutes and allow at most five attempts.
+`POST /api/v1/auth/verify-email/resend` is limited to one request per 60 seconds
+and three requests per hour per pending account.
 
 Recommended browser pattern: secure, HTTP-only, same-site cookies for
 session/refresh state. If bearer access tokens are used, define storage and

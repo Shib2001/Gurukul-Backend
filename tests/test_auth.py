@@ -1,5 +1,5 @@
 import uuid
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from http import HTTPStatus
 from unittest.mock import AsyncMock, Mock
 
@@ -14,8 +14,15 @@ from starlette.requests import Request
 from gurukul_be.core.config import Settings
 from gurukul_be.integrations.email import EmailNotConfiguredError
 from gurukul_be.main import app, http_error_handler
-from gurukul_be.models.identity import PasswordResetChallenge, StudentProfile, User
+from gurukul_be.models.identity import (
+    EmailVerificationChallenge,
+    PasswordResetChallenge,
+    StudentProfile,
+    User,
+)
 from gurukul_be.schemas.auth import (
+    EmailVerificationRequest,
+    EmailVerificationResendRequest,
     LoginRequest,
     PasswordResetConfirmRequest,
     PasswordResetRequest,
@@ -89,6 +96,8 @@ def test_auth_routes_are_registered() -> None:
     assert response.status_code == 200
     paths = response.json()["paths"]
     assert "/api/v1/auth/register" in paths
+    assert "/api/v1/auth/verify-email" in paths
+    assert "/api/v1/auth/verify-email/resend" in paths
     assert "/api/v1/auth/login" in paths
     assert "/api/v1/auth/refresh" in paths
     assert "/api/v1/auth/logout" in paths
@@ -97,10 +106,10 @@ def test_auth_routes_are_registered() -> None:
     assert "/api/v1/auth/password-reset/request" in paths
     assert "/api/v1/auth/password-reset/verify" in paths
     assert "/api/v1/auth/password-reset/confirm" in paths
-    response_schema = paths["/api/v1/auth/register"]["post"]["responses"]["201"][
+    response_schema = paths["/api/v1/auth/register"]["post"]["responses"]["202"][
         "content"
     ]["application/json"]["schema"]
-    assert response_schema["$ref"].endswith("ApiResponse_AuthData_")
+    assert response_schema["$ref"].endswith("ApiResponse_RegistrationPendingData_")
     auth_data_schema = response.json()["components"]["schemas"]["AuthData"][
         "properties"
     ]
@@ -201,30 +210,219 @@ async def test_registration_assigns_roll_number_and_persists_admission_data(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(auth, "_session_secret", lambda: "s" * 32)
-    monkeypatch.setattr(auth, "_create_access_token", lambda *args: "signed-token")
+    settings = Settings(EMAIL_VERIFICATION_RETURN_CODE_IN_RESPONSE=True)
+    monkeypatch.setattr(auth, "get_settings", lambda: settings)
     session = AsyncMock(spec=AsyncSession)
     session.scalar.side_effect = [None, 42]
     session.add = Mock()
+    background_tasks = BackgroundTasks()
 
-    result = await auth.register_student(session, valid_registration())
+    result = await auth.register_student(
+        session, valid_registration(), background_tasks
+    )
 
     user = session.add.call_args_list[0].args[0]
     assert user.roll_number == "GUR-26-000042"
+    assert user.status == "pending"
     assert user.password_hash != "a-strong-password"
     assert auth.password_hash.verify("a-strong-password", user.password_hash)
     assert user.profile.date_of_birth == date(2010, 5, 12)
     assert user.profile.grade_level == "10"
     assert user.profile.phone_number == "+919876543210"
     assert user.profile.liked_subjects == ["Mathematics", "Science"]
+    assert result["roll_number"] == "GUR-26-000042"
+    assert result["email"] == "student@example.com"
+    assert result["verification_code"].isdigit()
+    assert "access_token" not in result
+    assert "refresh_token" not in result
+    challenge = session.add.call_args_list[1].args[0]
+    assert challenge.code_hash == auth._email_verification_digest(
+        user.id, result["verification_code"]
+    )
+    assert background_tasks.tasks == []
+    assert session.flush.await_count == 2
+    session.commit.assert_awaited_once()
+    assert len(session.add.call_args_list) == 2
+
+
+@pytest.mark.asyncio
+async def test_registration_requires_email_delivery_or_dev_code_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(EMAIL_VERIFICATION_RETURN_CODE_IN_RESPONSE=False)
+    monkeypatch.setattr(auth, "get_settings", lambda: settings)
+
+    def reject_email_configuration(settings: Settings) -> None:
+        raise EmailNotConfiguredError("Email is disabled")
+
+    monkeypatch.setattr(
+        auth, "validate_email_configuration", reject_email_configuration
+    )
+    session = AsyncMock(spec=AsyncSession)
+
+    with pytest.raises(HTTPException) as error:
+        await auth.register_student(session, valid_registration(), BackgroundTasks())
+
+    assert error.value.status_code == 503
+    session.scalar.assert_not_awaited()
+    session.add.assert_not_called()
+
+
+def test_email_verification_schemas_require_six_digit_code() -> None:
+    assert (
+        EmailVerificationRequest(identifier="student@example.com", code="123456").code
+        == "123456"
+    )
+    assert EmailVerificationResendRequest(identifier="GUR-26-000042").identifier
+    with pytest.raises(ValidationError):
+        EmailVerificationRequest(identifier="student@example.com", code="12345")
+
+
+@pytest.mark.asyncio
+async def test_verifying_email_activates_account_and_issues_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(auth, "_session_secret", lambda: "s" * 32)
+    monkeypatch.setattr(auth, "_create_access_token", lambda *args: "signed-token")
+    user = User(
+        id=uuid.uuid4(),
+        email="student@example.com",
+        email_normalized="student@example.com",
+        roll_number="GUR-26-000042",
+        display_name="A Student",
+        status="pending",
+    )
+    user.profile = StudentProfile(grade_level="10", liked_subjects=["Mathematics"])
+    challenge = EmailVerificationChallenge(
+        user_id=user.id,
+        code_hash=auth._email_verification_digest(user.id, "123456"),
+        expires_at=datetime.now(UTC) + auth.EMAIL_VERIFICATION_CODE_TTL,
+        failed_attempts=0,
+        last_sent_at=datetime.now(UTC),
+        request_window_started_at=datetime.now(UTC),
+    )
+    session = AsyncMock(spec=AsyncSession)
+    session.scalar.side_effect = [user, challenge]
+    session.add = Mock()
+
+    result = await auth.verify_student_email(session, "student@example.com", "123456")
+
+    assert user.status == "active"
+    assert challenge.verified_at is not None
     assert result["access_token"] == "signed-token"
     assert len(result["refresh_token"]) >= 64
-    assert "access_expires_in_seconds" not in result
-    assert "refresh_expires_in_seconds" not in result
-    assert result["student"]["roll_number"] == "GUR-26-000042"
+    session.add.assert_called_once()
     session.commit.assert_awaited_once()
-    refresh_record = session.add.call_args_list[-1].args[0]
-    assert refresh_record.token_hash != result["refresh_token"]
-    assert refresh_record.auth_token_version == user.auth_token_version
+
+
+@pytest.mark.asyncio
+async def test_email_verification_locks_code_after_five_incorrect_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(auth, "_session_secret", lambda: "s" * 32)
+    user = User(
+        id=uuid.uuid4(),
+        email="student@example.com",
+        email_normalized="student@example.com",
+        roll_number="GUR-26-000042",
+        display_name="A Student",
+        status="pending",
+    )
+    challenge = EmailVerificationChallenge(
+        user_id=user.id,
+        code_hash=auth._email_verification_digest(user.id, "123456"),
+        expires_at=datetime.now(UTC) + auth.EMAIL_VERIFICATION_CODE_TTL,
+        failed_attempts=4,
+        last_sent_at=datetime.now(UTC),
+        request_window_started_at=datetime.now(UTC),
+    )
+    session = AsyncMock(spec=AsyncSession)
+    session.scalar.side_effect = [user, challenge]
+
+    with pytest.raises(HTTPException) as error:
+        await auth.verify_student_email(session, "student@example.com", "000000")
+
+    assert error.value.status_code == 400
+    assert challenge.failed_attempts == 5
+    assert challenge.expires_at <= datetime.now(UTC)
+    session.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_email_verification_resend_obeys_cooldown_and_hourly_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(auth, "_session_secret", lambda: "s" * 32)
+    settings = Settings(EMAIL_VERIFICATION_RETURN_CODE_IN_RESPONSE=True)
+    monkeypatch.setattr(auth, "get_settings", lambda: settings)
+    user = User(
+        id=uuid.uuid4(),
+        email="student@example.com",
+        email_normalized="student@example.com",
+        roll_number="GUR-26-000042",
+        display_name="A Student",
+        status="pending",
+    )
+    challenge = EmailVerificationChallenge(
+        user_id=user.id,
+        code_hash=auth._email_verification_digest(user.id, "123456"),
+        expires_at=datetime.now(UTC) + auth.EMAIL_VERIFICATION_CODE_TTL,
+        last_sent_at=datetime.now(UTC) - auth.EMAIL_VERIFICATION_RESEND_COOLDOWN,
+        request_window_started_at=datetime.now(UTC) - timedelta(minutes=10),
+        requests_in_window=3,
+    )
+    session = AsyncMock(spec=AsyncSession)
+    session.scalar.side_effect = [user, challenge]
+    background_tasks = BackgroundTasks()
+
+    result = await auth.resend_email_verification_code(
+        session, user.email, background_tasks
+    )
+
+    assert result == {"message": auth.EMAIL_VERIFICATION_MESSAGE}
+    assert challenge.requests_in_window == 3
+    assert background_tasks.tasks == []
+    session.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_email_verification_resend_rotates_code_and_resets_failed_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(auth, "_session_secret", lambda: "s" * 32)
+    settings = Settings(EMAIL_VERIFICATION_RETURN_CODE_IN_RESPONSE=True)
+    monkeypatch.setattr(auth, "get_settings", lambda: settings)
+    user = User(
+        id=uuid.uuid4(),
+        email="student@example.com",
+        email_normalized="student@example.com",
+        roll_number="GUR-26-000042",
+        display_name="A Student",
+        status="pending",
+    )
+    challenge = EmailVerificationChallenge(
+        user_id=user.id,
+        code_hash=auth._email_verification_digest(user.id, "123456"),
+        expires_at=datetime.now(UTC) + auth.EMAIL_VERIFICATION_CODE_TTL,
+        failed_attempts=2,
+        last_sent_at=datetime.now(UTC) - timedelta(minutes=2),
+        request_window_started_at=datetime.now(UTC) - timedelta(minutes=10),
+        requests_in_window=2,
+    )
+    session = AsyncMock(spec=AsyncSession)
+    session.scalar.side_effect = [user, challenge]
+
+    result = await auth.resend_email_verification_code(
+        session, user.email, BackgroundTasks()
+    )
+
+    new_code = result["verification_code"]
+    assert new_code.isdigit() and len(new_code) == 6
+    assert challenge.code_hash == auth._email_verification_digest(user.id, new_code)
+    assert challenge.failed_attempts == 0
+    assert challenge.requests_in_window == 3
+    assert challenge.expires_at > datetime.now(UTC)
+    session.commit.assert_awaited_once()
 
 
 @pytest.mark.parametrize(
@@ -275,6 +473,34 @@ async def test_login_accepts_roll_number_and_returns_token(
     assert result["access_token"] == "signed-token"
     assert len(result["refresh_token"]) >= 64
     assert result["student"]["email"] == "student@example.com"
+
+
+@pytest.mark.asyncio
+async def test_login_rejects_pending_account_even_with_correct_password(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(auth, "_session_secret", lambda: "s" * 32)
+    user = User(
+        id=uuid.uuid4(),
+        email="student@example.com",
+        email_normalized="student@example.com",
+        roll_number="GUR-26-000042",
+        password_hash=auth.password_hash.hash("a-strong-password"),
+        display_name="A Student",
+        status="pending",
+    )
+    session = AsyncMock(spec=AsyncSession)
+    session.scalar.return_value = user
+
+    with pytest.raises(HTTPException) as error:
+        await auth.login_student(
+            session,
+            LoginRequest(identifier=user.email, password="a-strong-password"),
+        )
+
+    assert error.value.status_code == 403
+    assert "Verify your email" in str(error.value.detail)
+    session.add.assert_not_called()
 
 
 @pytest.mark.asyncio

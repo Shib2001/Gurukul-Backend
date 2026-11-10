@@ -11,6 +11,9 @@ from gurukul_be.db.session import get_db
 from gurukul_be.models.identity import User
 from gurukul_be.schemas.auth import (
     AuthData,
+    EmailVerificationRequest,
+    EmailVerificationResendData,
+    EmailVerificationResendRequest,
     LoginRequest,
     MessageData,
     PasswordResetConfirmRequest,
@@ -20,6 +23,7 @@ from gurukul_be.schemas.auth import (
     PasswordResetVerifyRequest,
     RefreshRequest,
     RegisterRequest,
+    RegistrationPendingData,
     StudentResponse,
     UpdateProfileRequest,
 )
@@ -32,7 +36,9 @@ from gurukul_be.services.auth import (
     logout_student,
     refresh_student_tokens,
     register_student,
+    resend_email_verification_code,
     update_student_profile,
+    verify_student_email,
 )
 from gurukul_be.services.password_reset import (
     request_password_reset_code,
@@ -46,15 +52,45 @@ bearer_scheme = HTTPBearer()
 
 @router.post(
     "/register",
-    response_model=ApiResponse[AuthData],
-    status_code=status.HTTP_201_CREATED,
+    response_model=ApiResponse[RegistrationPendingData],
+    response_model_exclude_none=True,
+    status_code=status.HTTP_202_ACCEPTED,
 )
 async def register(
-    request: RegisterRequest, session: Annotated[AsyncSession, Depends(get_db)]
+    request: RegisterRequest,
+    background_tasks: BackgroundTasks,
+    session: Annotated[AsyncSession, Depends(get_db)],
 ) -> dict[str, object]:
     return success_response(
-        await register_student(session, request), status.HTTP_201_CREATED
+        await register_student(session, request, background_tasks),
+        status.HTTP_202_ACCEPTED,
     )
+
+
+@router.post("/verify-email", response_model=ApiResponse[AuthData])
+async def verify_email(
+    request: EmailVerificationRequest,
+    session: Annotated[AsyncSession, Depends(get_db)],
+) -> dict[str, object]:
+    result = await verify_student_email(session, request.identifier, request.code)
+    return success_response(result, status.HTTP_200_OK)
+
+
+@router.post(
+    "/verify-email/resend",
+    response_model=ApiResponse[EmailVerificationResendData],
+    response_model_exclude_none=True,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def resend_verification_email(
+    request: EmailVerificationResendRequest,
+    background_tasks: BackgroundTasks,
+    session: Annotated[AsyncSession, Depends(get_db)],
+) -> dict[str, object]:
+    result = await resend_email_verification_code(
+        session, request.identifier, background_tasks
+    )
+    return success_response(result, status.HTTP_202_ACCEPTED)
 
 
 @router.post("/login", response_model=ApiResponse[AuthData])

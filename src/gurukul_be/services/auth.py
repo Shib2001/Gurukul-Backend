@@ -1,27 +1,49 @@
 import hashlib
 import hmac
+import logging
 import secrets
+import smtplib
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
 import jwt
-from fastapi import HTTPException, status
+from fastapi import BackgroundTasks, HTTPException, status
 from pwdlib import PasswordHash
 from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from gurukul_be.core.config import get_settings
-from gurukul_be.models.identity import RefreshToken, StudentProfile, User
+from gurukul_be.core.config import Settings, get_settings
+from gurukul_be.integrations.email import (
+    EmailNotConfiguredError,
+    send_email_verification_code,
+    validate_email_configuration,
+)
+from gurukul_be.models.identity import (
+    EmailVerificationChallenge,
+    RefreshToken,
+    StudentProfile,
+    User,
+)
 from gurukul_be.schemas.auth import LoginRequest, RegisterRequest, UpdateProfileRequest
 
+logger = logging.getLogger(__name__)
 password_hash = PasswordHash.recommended()
 _DUMMY_PASSWORD_HASH = password_hash.hash("not-a-real-user-password")
 ACCESS_TOKEN_TTL = timedelta(minutes=30)
 REFRESH_TOKEN_TTL = timedelta(days=30)
+EMAIL_VERIFICATION_CODE_TTL = timedelta(minutes=10)
+EMAIL_VERIFICATION_RESEND_COOLDOWN = timedelta(seconds=60)
+EMAIL_VERIFICATION_REQUEST_WINDOW = timedelta(hours=1)
+MAX_EMAIL_VERIFICATION_REQUESTS_PER_WINDOW = 3
+MAX_EMAIL_VERIFICATION_ATTEMPTS = 5
+EMAIL_VERIFICATION_MESSAGE = (
+    "If the account is awaiting email verification, a verification code will be "
+    "sent to its registered email. Wait 60 seconds before requesting another."
+)
 
 
 def _session_secret() -> str:
@@ -90,9 +112,26 @@ def _auth_response(session: AsyncSession, user: User) -> dict[str, Any]:
 
 
 async def register_student(
-    session: AsyncSession, request: RegisterRequest
+    session: AsyncSession,
+    request: RegisterRequest,
+    background_tasks: BackgroundTasks,
 ) -> dict[str, Any]:
     _session_secret()
+    settings = get_settings()
+    return_code = (
+        settings.APP_ENV.casefold() == "development"
+        and settings.EMAIL_VERIFICATION_RETURN_CODE_IN_RESPONSE
+    )
+    if not return_code:
+        try:
+            validate_email_configuration(settings)
+        except EmailNotConfiguredError as error:
+            logger.error("Email verification is not configured")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Registration is temporarily unavailable",
+            ) from error
+
     email = str(request.email).strip()
     normalized_email = email.casefold()
     existing_user = await session.scalar(
@@ -118,7 +157,7 @@ async def register_student(
         roll_number=roll_number,
         password_hash=password_hash.hash(request.password),
         display_name=request.display_name,
-        status="active",
+        status="pending",
         auth_token_version=0,
     )
     user.profile = StudentProfile(
@@ -128,9 +167,23 @@ async def register_student(
         liked_subjects=request.liked_subjects,
     )
     session.add(user)
-    auth_data = _auth_response(session, user)
+
+    now = datetime.now(UTC)
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    challenge = EmailVerificationChallenge(
+        user_id=user.id,
+        code_hash=_email_verification_digest(user.id, code),
+        expires_at=now + EMAIL_VERIFICATION_CODE_TTL,
+        failed_attempts=0,
+        last_sent_at=now,
+        request_window_started_at=now,
+        requests_in_window=1,
+    )
 
     try:
+        await session.flush([user])
+        session.add(challenge)
+        await session.flush()
         await session.commit()
     except IntegrityError as error:
         await session.rollback()
@@ -149,6 +202,163 @@ async def register_student(
             ) from error
         raise
 
+    if return_code:
+        return {
+            "message": "Registration submitted. Verify your email to activate your account.",
+            "email": user.email,
+            "roll_number": user.roll_number,
+            "verification_code": code,
+        }
+
+    background_tasks.add_task(
+        _deliver_email_verification_code, user.email, code, settings
+    )
+    return {
+        "message": "Registration submitted. Check your email for the verification code.",
+        "email": user.email,
+        "roll_number": user.roll_number,
+    }
+
+
+def _email_verification_digest(user_id: UUID, code: str) -> str:
+    secret = _session_secret().encode("utf-8")
+    message = f"email-verification:{user_id}:{code}".encode()
+    return hmac.new(secret, message, hashlib.sha256).hexdigest()
+
+
+def _deliver_email_verification_code(
+    recipient: str, code: str, settings: Settings
+) -> None:
+    try:
+        send_email_verification_code(recipient, code, settings)
+    except (EmailNotConfiguredError, OSError, smtplib.SMTPException, ValueError):
+        logger.exception("Could not deliver an email-verification message")
+
+
+async def resend_email_verification_code(
+    session: AsyncSession,
+    identifier: str,
+    background_tasks: BackgroundTasks,
+) -> dict[str, str]:
+    settings = get_settings()
+    return_code = (
+        settings.APP_ENV.casefold() == "development"
+        and settings.EMAIL_VERIFICATION_RETURN_CODE_IN_RESPONSE
+    )
+    if not return_code:
+        try:
+            validate_email_configuration(settings)
+        except EmailNotConfiguredError as error:
+            logger.error("Email verification is not configured")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Email verification is temporarily unavailable",
+            ) from error
+
+    normalized_identifier = identifier.strip()
+    user = await session.scalar(
+        select(User)
+        .where(
+            or_(
+                User.email_normalized == normalized_identifier.casefold(),
+                User.roll_number == normalized_identifier.upper(),
+            ),
+            User.status == "pending",
+        )
+        .with_for_update()
+    )
+    if user is None:
+        return {"message": EMAIL_VERIFICATION_MESSAGE}
+
+    now = datetime.now(UTC)
+    challenge = await session.scalar(
+        select(EmailVerificationChallenge)
+        .where(EmailVerificationChallenge.user_id == user.id)
+        .with_for_update()
+    )
+    if challenge is None or challenge.verified_at is not None:
+        return {"message": EMAIL_VERIFICATION_MESSAGE}
+    if now - challenge.last_sent_at < EMAIL_VERIFICATION_RESEND_COOLDOWN:
+        return {"message": EMAIL_VERIFICATION_MESSAGE}
+
+    if now - challenge.request_window_started_at < EMAIL_VERIFICATION_REQUEST_WINDOW:
+        if challenge.requests_in_window >= MAX_EMAIL_VERIFICATION_REQUESTS_PER_WINDOW:
+            return {"message": EMAIL_VERIFICATION_MESSAGE}
+        challenge.requests_in_window += 1
+    else:
+        challenge.request_window_started_at = now
+        challenge.requests_in_window = 1
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    challenge.code_hash = _email_verification_digest(user.id, code)
+    challenge.expires_at = now + EMAIL_VERIFICATION_CODE_TTL
+    challenge.failed_attempts = 0
+    challenge.last_sent_at = now
+    await session.commit()
+
+    if return_code:
+        return {"message": EMAIL_VERIFICATION_MESSAGE, "verification_code": code}
+
+    background_tasks.add_task(
+        _deliver_email_verification_code, user.email, code, settings
+    )
+    return {"message": EMAIL_VERIFICATION_MESSAGE}
+
+
+async def verify_student_email(
+    session: AsyncSession, identifier: str, code: str
+) -> dict[str, Any]:
+    normalized_identifier = identifier.strip()
+    user = await session.scalar(
+        select(User)
+        .options(selectinload(User.profile))
+        .where(
+            or_(
+                User.email_normalized == normalized_identifier.casefold(),
+                User.roll_number == normalized_identifier.upper(),
+            ),
+            User.status == "pending",
+        )
+        .with_for_update()
+    )
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The verification code is invalid or expired. Request a new code.",
+        )
+
+    challenge = await session.scalar(
+        select(EmailVerificationChallenge)
+        .where(EmailVerificationChallenge.user_id == user.id)
+        .with_for_update()
+    )
+    now = datetime.now(UTC)
+    if (
+        challenge is None
+        or challenge.verified_at is not None
+        or challenge.expires_at <= now
+        or challenge.failed_attempts >= MAX_EMAIL_VERIFICATION_ATTEMPTS
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The verification code is invalid or expired. Request a new code.",
+        )
+
+    submitted_hash = _email_verification_digest(user.id, code)
+    if not hmac.compare_digest(challenge.code_hash, submitted_hash):
+        challenge.failed_attempts += 1
+        if challenge.failed_attempts >= MAX_EMAIL_VERIFICATION_ATTEMPTS:
+            challenge.expires_at = now
+        await session.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The verification code is invalid or expired. Request a new code.",
+        )
+
+    user.status = "active"
+    challenge.verified_at = now
+    auth_data = _auth_response(session, user)
+    await session.commit()
     return auth_data
 
 
@@ -188,7 +398,18 @@ async def login_student(session: AsyncSession, request: LoginRequest) -> dict[st
         user.password_hash if user and user.password_hash else _DUMMY_PASSWORD_HASH
     )
     password_matches = password_hash.verify(request.password, encoded_password)
-    if user is None or not password_matches or user.status != "active":
+    if user is None or not password_matches:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid roll number, name, or email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if user.status == "pending":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Verify your email address before signing in",
+        )
+    if user.status != "active":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid roll number, name, or email or password",
