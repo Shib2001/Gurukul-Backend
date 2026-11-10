@@ -902,6 +902,15 @@ FRONTEND_ORIGINS=http://localhost:3000
 AI_SERVICE_URL=http://localhost:8001
 AI_SERVICE_AUTH_KEY=replace-me
 SESSION_SECRET=replace-me
+SMTP_HOST=
+SMTP_PORT=587
+SMTP_USERNAME=
+SMTP_PASSWORD=
+SMTP_FROM_EMAIL=
+SMTP_USE_SSL=false
+SMTP_STARTTLS=true
+SMTP_TIMEOUT_SECONDS=10
+PASSWORD_RESET_RETURN_CODE_IN_RESPONSE=false
 OBJECT_STORAGE_BUCKET=gurukul-local
 OBJECT_STORAGE_ENDPOINT=http://localhost:9000
 OBJECT_STORAGE_ACCESS_KEY=replace-me
@@ -910,6 +919,11 @@ OTEL_EXPORTER_OTLP_ENDPOINT=
 ```
 
 Do not put real credentials in this file or commit local `.env` files.
+
+For local Swagger testing only, set `PASSWORD_RESET_RETURN_CODE_IN_RESPONSE=true`
+while `APP_ENV=development`. The password-reset request then returns the OTP
+instead of sending an email. This option is ignored outside development; keep it
+disabled outside local testing.
 
 ### 6.2 Required configuration behavior
 
@@ -937,6 +951,7 @@ Recommended fields:
 id
 email
 email_normalized
+roll_number
 password_hash nullable
 display_name
 status
@@ -951,6 +966,9 @@ deleted_at nullable
 Rules:
 
 - Unique normalized email.
+- Assign a unique, stable roll number at admission. Students may log in with
+  their roll number or email; name-based login is allowed only when the name
+  identifies exactly one student.
 - Never expose `password_hash`.
 - Use a status enum for active, pending, suspended, and deleted.
 - Soft deletion must comply with the privacy policy and retention rules.
@@ -960,8 +978,11 @@ Rules:
 ```text
 id
 user_id
+date_of_birth
 grade_level nullable
 learning_goals nullable
+phone_number
+liked_subjects
 preferred_language
 accessibility_preferences
 consent_version
@@ -1207,10 +1228,30 @@ POST   /api/v1/auth/login
 POST   /api/v1/auth/logout
 POST   /api/v1/auth/refresh
 POST   /api/v1/auth/verify-email
-POST   /api/v1/auth/forgot-password
-POST   /api/v1/auth/reset-password
+POST   /api/v1/auth/password-reset/request
+POST   /api/v1/auth/password-reset/verify
+POST   /api/v1/auth/password-reset/confirm
 GET    /api/v1/auth/me
+PATCH  /api/v1/auth/me
 ```
+
+`GET /api/v1/auth/me` returns the authenticated student's profile. `PATCH
+/api/v1/auth/me` accepts one or more of `display_name`, `date_of_birth`,
+`grade_level` (1–10), `liked_subjects`, and `phone_number`; omitted fields are
+unchanged. Roll number is immutable through this endpoint. Email changes require
+a separate verification flow, and password changes use a separate endpoint.
+
+Password reset codes are emailed, expire after 10 minutes, are stored only as
+keyed hashes, and allow at most five verification attempts. Requests are
+throttled per account; reset tokens expire after 15 minutes and are single-use.
+Set SMTP configuration before enabling these endpoints.
+
+Registration and login return a 30-minute access token and a 30-day refresh
+token. Refresh tokens are opaque, stored only as keyed hashes, and rotated on
+every refresh. Reuse of a revoked refresh token revokes all sessions for that
+account. Password reset invalidates outstanding access and refresh tokens.
+Logout revokes the submitted refresh token; an already-issued access token
+may remain valid until its short expiry.
 
 Recommended browser pattern: secure, HTTP-only, same-site cookies for
 session/refresh state. If bearer access tokens are used, define storage and
@@ -2288,4 +2329,3 @@ The backend is ready for its first production release when:
 - Unit, integration, contract, security, and end-to-end tests pass.
 - Backups have been restored successfully in a non-production environment.
 - Staging smoke tests pass before every production promotion.
-
