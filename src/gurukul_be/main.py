@@ -84,7 +84,11 @@ async def unexpected_error_handler(
 # Change this URL if your frontend runs on a different host or port.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Frontend URLs allowed to call this API.
+    allow_origins=[
+        origin.strip()
+        for origin in get_settings().FRONTEND_ORIGINS.split(",")
+        if origin.strip()
+    ],
     allow_credentials=True,  # Allow cookies or other browser credentials.
     allow_methods=["*"],  # Allow GET, POST, PATCH, DELETE, and other HTTP methods.
     allow_headers=[

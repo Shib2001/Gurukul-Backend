@@ -1,21 +1,78 @@
 services:
   postgres:
     image: postgres:16
-    container_name: gurukul-postgres
     environment:
-      POSTGRES_DB: gurukul
-      POSTGRES_USER: gurukul
-      POSTGRES_PASSWORD: dev-only-password
-    ports:
-      - "5433:5432"
+      POSTGRES_DB: ${POSTGRES_DB:-gurukul}
+      POSTGRES_USER: ${POSTGRES_USER:-gurukul}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in your .env file}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
-    container_name: gurukul-redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+    env_file:
+      - .env
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      PORT: 8000
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-gurukul}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-gurukul}
+      REDIS_URL: redis://redis:6379/0
     ports:
-      - "6379:6379"
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["production"]
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN in your .env file}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   postgres_data:
+  caddy_data:
+  caddy_config:
