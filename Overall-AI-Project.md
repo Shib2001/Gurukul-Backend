@@ -909,6 +909,31 @@ RPO - maximum acceptable data loss
 RTO - maximum acceptable recovery time
 ```
 
+### 12.7 Current backend learning deployment
+
+The backend currently has a manually operated EC2 learning deployment. It is
+for development and smoke testing, not for production users:
+
+```text
+Laptop
+  -> GitHub
+  -> SSH to one EC2 instance (Amazon Linux 2023, ap-southeast-2)
+      -> Docker Compose: FastAPI backend + PostgreSQL + Redis
+```
+
+The API is temporarily reachable over HTTP on port `8000`; SSH and API ingress
+are intended to be restricted to the operator's current IP. PostgreSQL and
+Redis are not public. PostgreSQL persists in a Docker named volume on the EC2
+instance, which is not a substitute for backups. The public IPv4 address may
+change after stopping and starting the instance. The EC2 `.env` is server-only
+and must not be copied from a development laptop or committed.
+
+This deployment does not yet meet the production architecture above: it has no
+domain/TLS, managed database or Redis, tested backup/restore, or automated
+CI/CD. The current temporary HTTP endpoint must not carry real credentials or
+sensitive student data. The operational procedure is in
+[`setup.md`](./setup.md).
+
 ---
 
 ## 13. Testing strategy
@@ -1045,4 +1070,3 @@ The first release is ready only when:
 - Critical student flows have end-to-end coverage.
 - Security, privacy, incident response, and data-deletion procedures are
   documented.
-

@@ -2042,6 +2042,54 @@ access logs where required.
 - Workers have no public ingress unless explicitly required.
 - Use security groups or network policies to restrict east-west traffic.
 
+### 18.8 Current EC2 learning deployment
+
+The current deployment is a single-instance learning and API smoke-test setup,
+not the production architecture described above:
+
+```text
+Internet (temporary HTTP, restricted by source IP)
+  -> EC2 public IPv4:8000
+      -> Docker Compose backend container
+          -> PostgreSQL container (private to the EC2 host / Compose network)
+          -> Redis container (private to the EC2 host / Compose network)
+```
+
+Current characteristics:
+
+- One EC2 `t3.small` instance running Amazon Linux 2023 in
+  `ap-southeast-2` (Sydney).
+- Docker Compose builds and runs the backend, PostgreSQL, and Redis on that
+  instance. The backend applies Alembic migrations during container startup.
+- The backend is published on host port `8000` for temporary direct HTTP
+  testing. The EC2 security group should restrict ports `22` (SSH) and `8000`
+  to the developer's current public IP.
+- PostgreSQL and Redis are not internet-facing. Their host bindings are
+  loopback-only (`127.0.0.1:5433` and `127.0.0.1:6379`); the backend uses the
+  Compose service addresses internally.
+- PostgreSQL files are stored in the Compose `postgres_data` named volume.
+  This volume is persistent across ordinary container recreation, but it is
+  not a backup and can be lost with instance or volume deletion.
+- The deployment uses the EC2 public IP and HTTP; it has no stable hostname or
+  TLS. The IP can change when the instance is stopped and started.
+- The server `.env` contains deployment secrets and is not committed. It must
+  not be replaced by a laptop `.env` during code deployment.
+
+Deployments are currently performed manually from an SSH session:
+
+```bash
+cd ~/Gurukul-Backend
+git pull --ff-only
+docker compose config --quiet
+docker compose up --build -d
+docker compose ps
+```
+
+See [`setup.md`](./setup.md) for the Windows-laptop-to-existing-EC2 procedure.
+Before real users or sensitive data are allowed, move to HTTPS with a domain
+and Caddy, disable development OTP responses, configure SMTP, restrict and
+review public access, and establish tested database backups and recovery.
+
 ---
 
 ## 19. Containerization
