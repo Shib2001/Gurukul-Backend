@@ -114,6 +114,11 @@ def root() -> dict[str, object]:
     return success_response({"message": "Gurukul backend is running"}, 200)
 
 
+@app.get("/test/root", response_model=ApiResponse[RootData])
+def test_root() -> dict[str, object]:
+    return success_response({"message": "Gurukul backend test route is working"}, 200)
+
+
 def main() -> None:
     # Keep the `gurukul-be` command configured in pyproject.toml working.
     import uvicorn

@@ -23,3 +23,13 @@ def test_health_ready() -> None:
         "message": "OK",
         "data": {"status": "ready"},
     }
+
+
+def test_root_test_route() -> None:
+    response = client.get("/test/root")
+    assert response.status_code == 200
+    assert response.json() == {
+        "status_code": 200,
+        "message": "OK",
+        "data": {"message": "Gurukul backend test route is working"},
+    }
