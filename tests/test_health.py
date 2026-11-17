@@ -33,3 +33,13 @@ def test_root_test_route() -> None:
         "message": "OK",
         "data": {"message": "Gurukul backend test route is working"},
     }
+
+
+def test_prod_test_prep_route() -> None:
+    response = client.get("/Prod-test-prep")
+    assert response.status_code == 200
+    assert response.json() == {
+        "status_code": 200,
+        "message": "OK",
+        "data": {"message": "Prod-test-prep route is working"},
+    }

@@ -102,11 +102,13 @@ From the repository folder on the server:
 docker compose --profile production up --build -d
 ```
 
-The first start builds the backend image, starts PostgreSQL and Redis, waits for
-their health checks, applies Alembic migrations, and then starts the API. Caddy
-requests and renews the HTTPS certificate for `DOMAIN` automatically. Once the
-containers are healthy, visit `https://api.example.com/docs` (replace this with
-your domain).
+The first start builds the backend Docker image on the EC2 server from the
+repository's `Dockerfile`, starts PostgreSQL and Redis, waits for their health
+checks, applies Alembic migrations, and then starts the API. Caddy requests and
+renews the HTTPS certificate for `DOMAIN` automatically. Once the containers
+are healthy, visit `https://api.example.com/docs` and
+`https://api.example.com/Prod-test-prep` (replace this with your domain). To
+confirm the built image is present on the server, run `docker image ls`.
 
 Useful commands:
 
