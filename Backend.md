@@ -631,6 +631,30 @@ Responses should include:
 
 Do not send unnecessary student profile data to the AI service.
 
+For the first text-chat slice, use contract version `2026-01` and
+`POST /internal/v1/chat/runs`. Authenticate with
+`Authorization: Bearer <AI_SERVICE_AUTH_KEY>` and send `X-Request-ID` and
+`Idempotency-Key`. The initial catalog IDs are `subject_math` and
+`teacher_math`. Keep `grade_level` a decimal string (`"1"` through `"10"`) on
+the internal contract; validate it against the backend profile before calling
+AI. Use `lesson_start` with an empty message list and no lesson state when a
+conversation is created. Use `lesson_turn` with at most 12 recent messages
+ending in the current student reply, plus the previously saved lesson state.
+Each message is capped at 4,000 characters. The initial limits are 700 output
+tokens and a 20-second AI deadline. The assistant answer is also capped at
+4,000 characters so it remains valid bounded context on later turns. Persist
+the returned `lesson_progress` in the conversation; this is teaching state,
+not a score.
+
+The operation is `lesson_start` for a new conversation and `lesson_turn` for a
+student reply. `lesson_start` has an empty message list and no prior lesson
+state. `lesson_turn` contains the bounded transcript ending in the current
+student reply, plus the backend-persisted `lesson_state`. The response includes
+`lesson_progress` (`topic`, `phase`, `understanding`, `next_action`) so the
+backend can persist the progression state and the UI can display whether the
+student is learning, being checked, or has finished the lesson. This metadata
+is tutoring guidance, not a score.
+
 #### `app/schemas/events.py`
 
 Define versioned event envelopes and payloads. Treat event schemas as
@@ -733,8 +757,9 @@ Call the internal AI service over HTTPS. This client must:
 - Support streaming with cancellation and terminal-state handling.
 - Expose provider-independent errors to application services.
 
-The backend must not call OpenRouter directly. OpenRouter belongs behind the
-AI service boundary.
+For the Week 4 non-streaming slice, use the shared HTTP client and
+`AI_SERVICE_TIMEOUT_SECONDS` to bound the request. The backend must not call
+OpenRouter directly. OpenRouter belongs behind the AI service boundary.
 
 #### `app/integrations/redis.py`
 
@@ -1281,13 +1306,15 @@ GET    /api/v1/students/me
 PATCH  /api/v1/students/me
 GET    /api/v1/subjects
 GET    /api/v1/subjects/{subject_id}
-GET    /api/v1/teachers
-GET    /api/v1/teachers/{teacher_id}
 GET    /api/v1/courses
 GET    /api/v1/courses/{course_id}
 ```
 
-Catalog responses should include cache headers or a cache policy where safe.
+`GET /api/v1/subjects` includes the one enabled teacher assigned to each
+published subject. Subject selection is teacher selection for the student API.
+Enforce one teacher per subject with a unique database constraint. The first
+lesson slice publishes Mathematics; Science and English teachers can be
+published when their AI lesson flows are ready.
 
 ### 8.3 Conversations and chat
 
@@ -1297,35 +1324,116 @@ GET    /api/v1/conversations
 GET    /api/v1/conversations/{conversation_id}
 PATCH  /api/v1/conversations/{conversation_id}
 GET    /api/v1/conversations/{conversation_id}/messages
-POST   /api/v1/conversations/{conversation_id}/messages
-GET    /api/v1/conversations/{conversation_id}/stream
+POST   /api/v1/auth/ws-tickets
+WS     /api/v1/ws/conversations/{conversation_id}
 ```
 
-Message creation should accept:
+HTTP remains responsible for login, the catalog, conversation creation, and
+loading saved history. Conversation creation accepts a subject ID and a
+client-generated idempotency UUID. The backend resolves the subject's one
+teacher and creates the conversation. The client then opens the authenticated
+WebSocket and sends `lesson.start`; the backend asks AI for the opening lesson
+and check-for-understanding question and persists the assistant message.
 
 ```json
 {
-  "client_message_id": "client-msg-unique-value",
-  "content": "Can you explain fractions?",
-  "content_format": "text",
-  "stream": true
+  "subject_id": "subject_math",
+  "client_conversation_id": "146909e5-3a15-4f2c-9a9c-142e3629a9a2"
 }
 ```
 
-The backend owns the server message ID and final status.
+The browser obtains a short-lived, single-use WebSocket ticket using its normal
+authenticated HTTP session. Do not put a long-lived access token in the
+WebSocket URL. The ticket is bound to the student, expires quickly, is consumed
+once, and must be redacted from access logs. The backend authenticates the
+socket and verifies ownership of the conversation before processing events.
+
+All student/teacher live events use this WebSocket; HTTP message POSTs are not
+the live-chat transport. Each JSON text frame has a `type` and a stable
+client-generated `event_id`. Example client events:
+
+```json
+{
+  "type": "lesson.start",
+  "event_id": "bd1f31d2-cbe3-4f06-aea0-f30e60378f24"
+}
+```
+
+```json
+{
+  "type": "message.send",
+  "event_id": "7eb647be-2630-4e8c-a510-e889b714bc53",
+  "client_message_id": "7eb647be-2630-4e8c-a510-e889b714bc53",
+  "content": "A triangle has three sides.",
+  "content_format": "text"
+}
+```
+
+Server events include `lesson.started`, `message.accepted`,
+`assistant.delta`, `message.completed`, `message.failed`, and `error`.
+`assistant.delta` is forwarded only when the AI service's authenticated
+upstream stream is enabled; otherwise the backend sends the completed response
+event without token deltas. A terminal event includes the persisted message
+IDs, final status, lesson progress, citations, and safe error details as
+applicable.
+
+`client_message_id` is a UUID and is unique within the conversation. Repeating
+the same ID and body returns the saved turn; reusing the ID with a different
+body returns a conflict. The backend persists the user message and pending
+assistant message before calling AI. A socket disconnect does not erase the
+turn: the backend completes or records its failure, and reconnecting clients
+load durable state over HTTP or retry with the same idempotency ID. The backend
+owns server message IDs and the final `pending`, `completed`, `failed`, or
+`blocked` status.
+
+The AI lesson flow is turn-based. The first AI operation starts the lesson
+without prior messages. Each later operation evaluates the student's reply as
+correct, partial, incorrect, or unclear; gives supportive feedback; then
+continues, reteaches, clarifies, or asks the next check question. The AI may
+return a descriptive lesson phase/action, but it does not award scores or write
+authoritative progress records.
+
+The AI service may use Redis to cache an idempotent run result for an exact
+request (request fingerprint plus key, with a bounded TTL) so retries do not
+repeat a provider call. Redis is an optimization/coordination layer, not lesson
+memory or the durable record. The backend database remains authoritative for
+conversation messages and lesson state; each AI call receives bounded recent
+history and the saved lesson-state summary. Never reuse cached output across a
+different user, conversation, grade, teacher, language, or request body.
+
+WebSockets reduce repeated connection setup and allow the backend to deliver
+events as they happen; they do not make model generation itself faster and are
+not a cache. Use Redis for single-use socket tickets, rate limits, exact
+idempotency retries, and short-lived caches. RAG retrieval-result caches may be
+keyed by subject, grade, language, curriculum, query, and content version.
+Never cache or share raw student audio. A TTS result may be cached only for an
+exact text/voice/language/model-version match and only when it contains no
+student-specific or sensitive content.
 
 ### 8.4 Voice
 
 ```text
-POST   /api/v1/voice/sessions
-POST   /api/v1/voice/uploads
-GET    /api/v1/voice/jobs/{job_id}
+WS     /api/v1/ws/conversations/{conversation_id}
 GET    /api/v1/voice/audio/{audio_id}
 DELETE /api/v1/voice/audio/{audio_id}
 ```
 
-The upload response should not grant broad bucket access. Use a short-lived,
-object-specific signed URL or proxy the upload through a controlled endpoint.
+The first voice mode is turn-based on the same authenticated conversation
+WebSocket. A client sends `voice.turn.start` with a stable `client_turn_id`,
+language, and allowed audio format; streams bounded audio frames; then sends
+`voice.turn.end`. The backend forwards audio for transcription, sends the
+transcript through the same grade-aware lesson flow and RAG policy, and relays
+the teacher's generated audio. Server events include `voice.transcript`,
+`assistant.delta`/`message.completed`, `voice.audio.start`, binary audio frames,
+`voice.audio.end`, and `message.failed`. Enforce format, duration, byte limits,
+timeouts, and per-student usage limits. Persist the transcript and assistant
+text as conversation messages; raw audio is transient and deleted by default
+unless a separate retention policy and user consent permit storage.
+
+The backend-to-AI calls remain private, authenticated HTTP calls; the browser
+never connects directly to the AI service or an audio provider. The AI service
+owns speech recognition and synthesis. Use streaming responses where supported
+so the backend can forward text/audio events over the client WebSocket.
 
 ### 8.5 Quizzes and attempts
 
@@ -1404,7 +1512,7 @@ Conceptually:
   "contract_version": "2026-01",
   "request_id": "req_01...",
   "idempotency_key": "chat_01...",
-  "operation": "tutor_chat",
+  "operation": "lesson_turn",
   "user_ref": "usr_opaque",
   "conversation_ref": "conv_opaque",
   "teacher_bot_id": "teacher_math",
@@ -1413,6 +1521,12 @@ Conceptually:
     "grade_level": "8",
     "language": "en",
     "learning_preferences": ["step_by_step"]
+  },
+  "lesson_state": {
+    "topic": "Fractions",
+    "phase": "checking_understanding",
+    "understanding": "not_assessed",
+    "next_action": "ask_question"
   },
   "messages": [
     {
@@ -1432,6 +1546,9 @@ Conceptually:
   }
 }
 ```
+
+For `lesson_start`, set `"operation": "lesson_start"`, send
+`"messages": []`, and omit `lesson_state`.
 
 Do not send authentication cookies, password data, unnecessary profile
 fields, or unrestricted conversation history.

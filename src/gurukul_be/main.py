@@ -1,6 +1,8 @@
 import logging
+from contextlib import asynccontextmanager
 from http import HTTPStatus
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,13 +11,24 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from gurukul_be.api.responses import success_response
 from gurukul_be.api.v1.auth import router as auth_router
+from gurukul_be.api.v1.conversations import router as learning_router
 from gurukul_be.core.config import get_settings
 from gurukul_be.schemas.common import ApiResponse, HealthData, RootData
 
 logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    application.state.ai_http_client = httpx.AsyncClient()
+    try:
+        yield
+    finally:
+        await application.state.ai_http_client.aclose()
+
+
 # Create the FastAPI application. Route decorators below attach endpoints to it.
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 
 
 def _status_message(status_code: int) -> str:
@@ -97,6 +110,7 @@ app.add_middleware(
 )
 
 app.include_router(auth_router, prefix=get_settings().API_V1_PREFIX)
+app.include_router(learning_router, prefix=get_settings().API_V1_PREFIX)
 
 
 @app.get("/health/live", response_model=ApiResponse[HealthData])

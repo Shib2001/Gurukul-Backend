@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     FRONTEND_ORIGINS: str = "http://localhost:3000"
     AI_SERVICE_URL: str = "http://localhost:8001"
     AI_SERVICE_AUTH_KEY: str = "replace-me"
+    AI_SERVICE_TIMEOUT_SECONDS: int = Field(default=22, gt=0, le=60)
     SESSION_SECRET: str = "replace-me"
     SMTP_HOST: str = ""
     SMTP_PORT: int = Field(default=587, ge=1, le=65535)

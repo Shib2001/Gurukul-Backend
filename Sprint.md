@@ -506,7 +506,6 @@ Implement:
 
 ```text
 GET  /api/v1/subjects
-GET  /api/v1/teachers
 POST /api/v1/conversations
 GET  /api/v1/conversations
 GET  /api/v1/conversations/{id}/messages
@@ -520,6 +519,9 @@ Add:
 - Idempotency keys
 - Pending/completed/failed message states
 - Backend-to-AI HTTP client
+- One teacher per subject; selecting a subject resolves that teacher
+- Start a lesson with the teacher's opening explanation and question
+- Continue the lesson by evaluating answers and adapting the next turn
 
 ## AI tasks
 
